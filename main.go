@@ -2,18 +2,21 @@ package grpcclientlb
 
 import (
 	"errors"
+	"fmt"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 )
 
 type GrpcClientLB interface {
 	Get() *grpc.ClientConn
+	Close() error
 }
 
 type grpcClientLB struct {
 	grpcClient []*grpc.ClientConn
-	size       int
-	offset     int
+	size       uint32
+	offset     uint32
 }
 
 func NewGrpcClientLB(factory func() (*grpc.ClientConn, error), poolSize int) (GrpcClientLB, error) {
@@ -25,7 +28,10 @@ func NewGrpcClientLB(factory func() (*grpc.ClientConn, error), poolSize int) (Gr
 	for i := 0; i < poolSize; i++ {
 		conn, err := factory()
 		if err != nil {
-			return nil, err
+			for j := 0; j < i; j++ {
+				_ = grpcClient[j].Close()
+			}
+			return nil, fmt.Errorf("failed to create connection at index %d: %w", i, err)
 		}
 
 		grpcClient[i] = conn
@@ -33,18 +39,27 @@ func NewGrpcClientLB(factory func() (*grpc.ClientConn, error), poolSize int) (Gr
 
 	return &grpcClientLB{
 		grpcClient: grpcClient,
-		size:       len(grpcClient),
+		size:       uint32(poolSize),
 		offset:     0,
 	}, nil
 }
 
 func (g *grpcClientLB) Get() *grpc.ClientConn {
-	if g.offset >= g.size {
-		g.offset = 0
+	n := atomic.AddUint32(&g.offset, 1)
+
+	return g.grpcClient[(n-1)%g.size]
+}
+
+func (g *grpcClientLB) Close() error {
+	var errs []error
+	for _, conn := range g.grpcClient {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	conn := g.grpcClient[g.offset]
-	g.offset = (g.offset + 1) % g.size
-
-	return conn
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to close %d connections", len(errs))
+	}
+	return nil
 }
